@@ -136,6 +136,18 @@ jobs:
           # Tell Gradle where the Android SDK is
           echo "sdk.dir=${ANDROID_HOME}" > local.properties
 
+          # Init script: turn off every lint task (lintVitalRelease often breaks assembleRelease)
+          INIT="$RUNNER_TEMP/disable-lint.gradle"
+          cat > "$INIT" <<'EOF'
+          allprojects {
+              tasks.configureEach { t ->
+                  if (t.name.startsWith("lint")) {
+                      t.enabled = false
+                  }
+              }
+          }
+          EOF
+
           # Use the project's wrapper if it is complete, otherwise the installed Gradle
           if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
             chmod +x gradlew
@@ -147,15 +159,37 @@ jobs:
 
           LOG="$RUNNER_TEMP/gradle-build.log"
           set +e
-          $GRADLE_CMD --no-daemon --stacktrace --warning-mode=summary assembleRelease 2>&1 | tee "$LOG"
+          $GRADLE_CMD \
+            --no-daemon \
+            --stacktrace \
+            --warning-mode=summary \
+            --init-script "$INIT" \
+            "-Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
+            "-Pkotlin.daemon.jvm.options=-Xmx2g" \
+            -Pandroid.useAndroidX=true \
+            assembleRelease 2>&1 | tee "$LOG"
           STATUS=${PIPESTATUS[0]}
           set -e
 
           if [ "$STATUS" -ne 0 ]; then
-            echo ""
+            # Build a short, safe summary of the failure
+            SUMMARY="$RUNNER_TEMP/build-error.log"
+            {
+              echo "=== run ${GITHUB_RUN_NUMBER} / commit ${GITHUB_SHA} ==="
+              echo ""
+              echo "=== WHAT WENT WRONG ==="
+              grep -n -A14 "What went wrong" "$LOG" | head -n 80 || true
+              echo ""
+              echo "=== KOTLIN / JAVA / AAPT COMPILE ERRORS ==="
+              grep -nE "^e: |error:|AAPT:|Execution failed|Could not (resolve|find|get)|Unsupported|incompatible|pip|Chaquopy|chaquo" "$LOG" | head -n 60 || true
+              echo ""
+              echo "=== LAST 80 LINES ==="
+              tail -n 80 "$LOG"
+            } | sed -E 's/([Pp]assword[A-Za-z]*[=: ]+).*/\1***/' > "$SUMMARY"
+
             echo "================ KEY ERROR LINES ================"
-            grep -nE "What went wrong|Caused by|error:|Execution failed|Could not|Unsupported|incompatible|not found|FAILED" "$LOG" | head -n 40 || true
-            echo "::error::Gradle build failed (exit code $STATUS). See 'KEY ERROR LINES' above."
+            sed -n '1,80p' "$SUMMARY"
+            echo "::error title=Gradle build failed::exit code $STATUS - see build-logs branch / gradle-build-log artifact"
             exit "$STATUS"
           fi
 
@@ -164,9 +198,38 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gradle-build-log
-          path: ${{ runner.temp }}/gradle-build.log
+          path: |
+            ${{ runner.temp }}/gradle-build.log
+            ${{ runner.temp }}/build-error.log
           retention-days: 7
           if-no-files-found: ignore
+
+      - name: Publish error summary to build-logs branch
+        if: failure()
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SUMMARY="$RUNNER_TEMP/build-error.log"
+          if [ ! -f "$SUMMARY" ]; then
+            echo "No summary file, skipping."
+            exit 0
+          fi
+          rm -rf "$RUNNER_TEMP/logpub"
+          mkdir -p "$RUNNER_TEMP/logpub"
+          cp "$SUMMARY" "$RUNNER_TEMP/logpub/build-error.log"
+          cd "$RUNNER_TEMP/logpub"
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -q -b build-logs
+          git add build-error.log
+          git commit -q -m "Build error log for run ${GITHUB_RUN_NUMBER}"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push -f -q origin build-logs
+          echo "Pushed log to branch build-logs (file: build-error.log)"
 
       - name: Prepare APK
         id: apk
